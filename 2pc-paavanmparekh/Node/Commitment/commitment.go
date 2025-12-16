@@ -52,6 +52,22 @@ type TransactionState struct {
 	Timer                *time.Timer
 	LastError            string
 	AcknowledgedDecision bool
+	CleanupAt            time.Time
+}
+
+type TwoPCStatusRequest struct {
+	TxnID string
+}
+
+type TwoPCStatusResponse struct {
+	TxnID              string
+	Known              bool
+	Phase              configurations.TwoPCPhase
+	Decision           configurations.TwoPCPhase
+	Role               configurations.TwoPCRole
+	SeqNo              int
+	CoordinatorCluster int
+	ParticipantCluster int
 }
 
 type WALRecord struct {
@@ -141,6 +157,16 @@ func (w *WALManager) Clear(txnID string) error {
 	return err
 }
 
+func (w *WALManager) ClearAll() error {
+	if w == nil || w.db == nil {
+		return fmt.Errorf("wal manager not initialized")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, err := w.db.Exec(`DELETE FROM wal_records`)
+	return err
+}
+
 type DecisionRequest struct {
 	TxnID              string
 	Decision           configurations.TwoPCPhase
@@ -153,7 +179,8 @@ type DecisionRequest struct {
 }
 
 type DecisionResponse struct {
-	TxnID  string
-	Ack    bool
-	Reason string
+	TxnID    string
+	Ack      bool
+	Reason   string
+	LeaderID int
 }

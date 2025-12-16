@@ -10,6 +10,77 @@ import (
 	"time"
 )
 
+const (
+	keyspaceMin = 1
+	keyspaceMax = 9000
+)
+
+type ClusterLayout struct {
+	ClusterCount    int `json:"clusterCount"`
+	NodesPerCluster int `json:"nodesPerCluster"`
+}
+
+var (
+	clusterLayout     ClusterLayout
+	clusterLayoutOnce sync.Once
+)
+
+func clusterConfigPath() string {
+	if _, err := os.Stat("Configurations"); err == nil {
+		return filepath.Join("Configurations", "cluster_config.json")
+	}
+	return filepath.Join("..", "Configurations", "cluster_config.json")
+}
+
+func loadClusterLayoutFromDisk() ClusterLayout {
+	layout := ClusterLayout{ClusterCount: 3, NodesPerCluster: 3}
+	path := clusterConfigPath()
+	bytes, err := os.ReadFile(path)
+	if err != nil || len(bytes) == 0 {
+		return layout
+	}
+	var diskLayout ClusterLayout
+	if err := json.Unmarshal(bytes, &diskLayout); err != nil {
+		return layout
+	}
+	if diskLayout.ClusterCount > 0 {
+		layout.ClusterCount = diskLayout.ClusterCount
+	}
+	if diskLayout.NodesPerCluster > 0 {
+		layout.NodesPerCluster = diskLayout.NodesPerCluster
+	}
+	return layout
+}
+
+func getClusterLayout() ClusterLayout {
+	clusterLayoutOnce.Do(func() {
+		clusterLayout = loadClusterLayoutFromDisk()
+		if clusterLayout.ClusterCount <= 0 {
+			clusterLayout.ClusterCount = 3
+		}
+		if clusterLayout.NodesPerCluster <= 0 {
+			clusterLayout.NodesPerCluster = 3
+		}
+	})
+	return clusterLayout
+}
+
+func ClusterCount() int {
+	return getClusterLayout().ClusterCount
+}
+
+func NodesPerCluster() int {
+	return getClusterLayout().NodesPerCluster
+}
+
+func TotalNodeCount() int {
+	layout := getClusterLayout()
+	if layout.ClusterCount <= 0 || layout.NodesPerCluster <= 0 {
+		return 0
+	}
+	return layout.ClusterCount * layout.NodesPerCluster
+}
+
 type TwoPCPhase string
 
 const (
@@ -41,11 +112,10 @@ type Node struct {
 	Bnum      BallotNumber
 	AcceptLog []AcceptLog
 
-	// Client/txn tracking for deduplication with int client IDs (0..8999)
-	ClientLastReply   map[int]int      // clientID -> last timestamp
-	TxnsProcessed     map[string]Reply // sender:timestamp -> reply
-	T                 time.Duration    // election timeout
-	Tp                time.Duration    // proposal timeout
+	ClientLastReply   map[int]int
+	TxnsProcessed     map[string]Reply
+	T                 time.Duration
+	Tp                time.Duration
 	IsLive            bool
 	SequenceNumber    int
 	Timestamp         int
@@ -184,9 +254,13 @@ func maybeReloadShardOverrides() {
 		}
 	}
 	updated := make(map[int]int, len(raw))
+	maxCluster := getClusterLayout().ClusterCount
 	for keyStr, clusterID := range raw {
 		keyInt, err := strconv.Atoi(keyStr)
 		if err != nil {
+			continue
+		}
+		if clusterID < 1 || (maxCluster > 0 && clusterID > maxCluster) {
 			continue
 		}
 		updated[keyInt] = clusterID
@@ -197,24 +271,59 @@ func maybeReloadShardOverrides() {
 	shardOverridesMu.Unlock()
 }
 
-func DefaultClusterForKey(key int) int {
-	switch {
-	case key >= 1 && key <= 3000:
-		return 1
-	case key >= 3001 && key <= 6000:
-		return 2
-	case key >= 6001 && key <= 9000:
-		return 3
-	default:
-		return 0
+func GetClusterKeyRange(clusterId int) (int, int) {
+	layout := getClusterLayout()
+	if clusterId < 1 || clusterId > layout.ClusterCount {
+		return 0, 0
 	}
+	totalKeys := keyspaceMax - keyspaceMin + 1
+	if totalKeys <= 0 {
+		return 0, 0
+	}
+	base := totalKeys / layout.ClusterCount
+	remainder := totalKeys % layout.ClusterCount
+	start := keyspaceMin + (clusterId-1)*base
+	if remainder > 0 {
+		extra := clusterId - 1
+		if extra > remainder {
+			extra = remainder
+		}
+		start += extra
+	}
+	size := base
+	if remainder > 0 && clusterId <= remainder {
+		size++
+	}
+	if size <= 0 {
+		return start, start - 1
+	}
+	end := start + size - 1
+	if end > keyspaceMax {
+		end = keyspaceMax
+	}
+	return start, end
+}
+
+func DefaultClusterForKey(key int) int {
+	layout := getClusterLayout()
+	for clusterId := 1; clusterId <= layout.ClusterCount; clusterId++ {
+		start, end := GetClusterKeyRange(clusterId)
+		if end < start {
+			continue
+		}
+		if key >= start && key <= end {
+			return clusterId
+		}
+	}
+	return 0
 }
 
 func ResolveClusterIDForKey(key int) int {
 	maybeReloadShardOverrides()
+	maxCluster := getClusterLayout().ClusterCount
 	shardOverridesMu.RLock()
 	if shardOverrides != nil {
-		if cid, ok := shardOverrides[key]; ok && cid >= 1 && cid <= 3 {
+		if cid, ok := shardOverrides[key]; ok && cid >= 1 && cid <= maxCluster {
 			shardOverridesMu.RUnlock()
 			return cid
 		}
@@ -236,9 +345,10 @@ func GetShardOverrides() map[int]int {
 
 func SetShardOverrides(overrides map[int]int) error {
 	path := shardMappingPath()
+	maxCluster := getClusterLayout().ClusterCount
 	raw := make(map[string]int, len(overrides))
 	for key, clusterID := range overrides {
-		if clusterID < 1 || clusterID > 3 {
+		if clusterID < 1 || maxCluster > 0 && clusterID > maxCluster {
 			continue
 		}
 		raw[strconv.Itoa(key)] = clusterID
@@ -258,11 +368,25 @@ func SetShardOverrides(overrides map[int]int) error {
 		shardOverridesMu.Lock()
 		shardOverrides = make(map[int]int, len(overrides))
 		for k, v := range overrides {
-			shardOverrides[k] = v
+			if v >= 1 && (maxCluster == 0 || v <= maxCluster) {
+				shardOverrides[k] = v
+			}
 		}
 		shardOverridesClock = info.ModTime()
 		shardOverridesMu.Unlock()
 	}
+	return nil
+}
+
+func ClearShardOverrides() error {
+	path := shardMappingPath()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	shardOverridesMu.Lock()
+	shardOverrides = nil
+	shardOverridesClock = time.Time{}
+	shardOverridesMu.Unlock()
 	return nil
 }
 
@@ -277,15 +401,23 @@ func GetClusterForKey(key int) *Cluster {
 
 func NewCluster(id int) *Cluster {
 	leaderID := GetClusterLeaderID(id)
+	capacity := NodesPerCluster()
+	if capacity <= 0 {
+		capacity = 1
+	}
 	return &Cluster{
 		Id:     id,
-		Nodes:  make([]*Node, 0, 3),
+		Nodes:  make([]*Node, 0, capacity),
 		Leader: leaderID,
 	}
 }
 
 func GetClusterLeaderID(clusterId int) int {
-	return (clusterId-1)*3 + 1
+	layout := getClusterLayout()
+	if clusterId < 1 || clusterId > layout.ClusterCount || layout.NodesPerCluster <= 0 {
+		return 0
+	}
+	return (clusterId-1)*layout.NodesPerCluster + 1
 }
 
 func GetNodePort(nodeId int) int {
@@ -293,20 +425,27 @@ func GetNodePort(nodeId int) int {
 }
 
 func GetClusterNodeIDs(clusterId int) []int {
-	start := (clusterId-1)*3 + 1
-	return []int{start, start + 1, start + 2}
+	layout := getClusterLayout()
+	if clusterId < 1 || clusterId > layout.ClusterCount || layout.NodesPerCluster <= 0 {
+		return nil
+	}
+	start := (clusterId-1)*layout.NodesPerCluster + 1
+	ids := make([]int, 0, layout.NodesPerCluster)
+	for i := 0; i < layout.NodesPerCluster; i++ {
+		ids = append(ids, start+i)
+	}
+	return ids
 }
 
 func GetNodeConfig(nodeID int) (int, int, bool) {
-	nodeConfigs := map[int]struct {
-		id        int
-		clusterId int
-	}{
-		1: {1, 1}, 2: {2, 1}, 3: {3, 1},
-		4: {4, 2}, 5: {5, 2}, 6: {6, 2},
-		7: {7, 3}, 8: {8, 3}, 9: {9, 3},
+	layout := getClusterLayout()
+	if nodeID < 1 || layout.NodesPerCluster <= 0 || layout.ClusterCount <= 0 {
+		return 0, 0, false
 	}
-
-	cfg, exists := nodeConfigs[nodeID]
-	return cfg.id, cfg.clusterId, exists
+	totalNodes := layout.ClusterCount * layout.NodesPerCluster
+	if nodeID > totalNodes {
+		return 0, 0, false
+	}
+	clusterId := (nodeID-1)/layout.NodesPerCluster + 1
+	return nodeID, clusterId, true
 }

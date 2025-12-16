@@ -5,12 +5,14 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 type Logger struct {
 	file   *os.File
 	logger *log.Logger
 	mu     sync.Mutex
+	muted  uint32
 }
 
 var loggers = make(map[int]*Logger)
@@ -40,9 +42,36 @@ func GetLogger(nodeID int) *Logger {
 }
 
 func (l *Logger) Log(format string, args ...interface{}) {
+	if atomic.LoadUint32(&l.muted) == 1 {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.logger.Printf(format, args...)
+}
+
+func (l *Logger) SetMuted(enabled bool) {
+	if enabled {
+		atomic.StoreUint32(&l.muted, 1)
+		return
+	}
+	atomic.StoreUint32(&l.muted, 0)
+}
+
+func (l *Logger) Clear() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	if err := l.file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := l.file.Seek(0, 0); err != nil {
+		return err
+	}
+	l.logger = log.New(l.file, "", log.LstdFlags)
+	return nil
 }
 
 func (l *Logger) Close() {

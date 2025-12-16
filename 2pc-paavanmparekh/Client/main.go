@@ -2,10 +2,12 @@ package main
 
 import (
 	configurations "2pc-paavanmparekh/Configurations"
+	nodelogger "2pc-paavanmparekh/Node/logger"
 	"bufio"
 	"context"
 	"encoding/csv"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/rpc"
@@ -14,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,11 +49,116 @@ func newPerformanceTracker() *performanceTracker {
 	return &performanceTracker{}
 }
 
+type rpcClientSlot struct {
+	mu     sync.Mutex
+	client *rpc.Client
+}
+
+type rpcPooledClient struct {
+	mu    sync.Mutex
+	slots []*rpcClientSlot
+	next  int
+}
+
+const rpcPoolSize = 32
+
 var (
 	lastSetMu           sync.RWMutex
 	lastSetTransactions []configurations.Transaction
 	reshardMu           sync.Mutex
+	benchmarkModeFlag   uint32
+	benchmarkLoggerMu   sync.RWMutex
+	benchmarkLogger     *nodelogger.Logger
+	rpcClientPool       = struct {
+		sync.Mutex
+		clients map[int]*rpcPooledClient
+	}{
+		clients: make(map[int]*rpcPooledClient),
+	}
 )
+
+func enableBenchmarkMode() {
+	atomic.StoreUint32(&benchmarkModeFlag, 1)
+}
+
+func disableBenchmarkMode() {
+	atomic.StoreUint32(&benchmarkModeFlag, 0)
+}
+
+func benchmarkingEnabled() bool {
+	return atomic.LoadUint32(&benchmarkModeFlag) == 1
+}
+
+func ensureBenchmarkLogger() {
+	benchmarkLoggerMu.Lock()
+	defer benchmarkLoggerMu.Unlock()
+	if benchmarkLogger == nil {
+		benchmarkLogger = nodelogger.GetLogger(0)
+	}
+}
+
+func benchmarkLogf(format string, args ...interface{}) {
+	if !benchmarkingEnabled() {
+		return
+	}
+	benchmarkLoggerMu.RLock()
+	logger := benchmarkLogger
+	benchmarkLoggerMu.RUnlock()
+	if logger == nil {
+		return
+	}
+	logger.Log(format, args...)
+}
+
+func benchmarkPrintf(format string, args ...interface{}) {
+	if benchmarkingEnabled() {
+		benchmarkLogf(format, args...)
+		return
+	}
+	fmt.Printf(format, args...)
+}
+
+func (p *rpcPooledClient) pickSlot() *rpcClientSlot {
+	p.mu.Lock()
+	slot := p.slots[p.next]
+	p.next = (p.next + 1) % len(p.slots)
+	p.mu.Unlock()
+	return slot
+}
+
+func getRPCClient(nodeID int) (*rpcPooledClient, error) {
+	rpcClientPool.Lock()
+	if pooled, ok := rpcClientPool.clients[nodeID]; ok {
+		rpcClientPool.Unlock()
+		return pooled, nil
+	}
+	slots := make([]*rpcClientSlot, rpcPoolSize)
+	for i := range slots {
+		slots[i] = &rpcClientSlot{}
+	}
+	pooled := &rpcPooledClient{slots: slots}
+	rpcClientPool.clients[nodeID] = pooled
+	rpcClientPool.Unlock()
+	return pooled, nil
+}
+
+func invalidateRPCClient(nodeID int) {
+	rpcClientPool.Lock()
+	if pooled, ok := rpcClientPool.clients[nodeID]; ok {
+		rpcClientPool.Unlock()
+		for _, slot := range pooled.slots {
+			slot.mu.Lock()
+			if slot.client != nil {
+				slot.client.Close()
+				slot.client = nil
+			}
+			slot.mu.Unlock()
+		}
+		rpcClientPool.Lock()
+		delete(rpcClientPool.clients, nodeID)
+	}
+	rpcClientPool.Unlock()
+}
 
 func (p *performanceTracker) record(start, end time.Time) {
 	if end.Before(start) {
@@ -84,6 +192,17 @@ func (p *performanceTracker) summary() (count int, duration time.Duration, throu
 	return
 }
 
+func (p *performanceTracker) snapshotTotals() (count int, totalLatency time.Duration, duration time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count = p.txnCount
+	totalLatency = p.totalLatency
+	if !p.earliestStart.IsZero() && !p.latestEnd.IsZero() && p.latestEnd.After(p.earliestStart) {
+		duration = p.latestEnd.Sub(p.earliestStart)
+	}
+	return
+}
+
 func startInputReader() <-chan string {
 	ch := make(chan string)
 	go func() {
@@ -109,6 +228,20 @@ func triggerPrintReshardCommand() {
 }
 
 func main() {
+	benchmarkPath := flag.String("benchmark", "", "Path to benchmark workload config")
+	flag.Parse()
+
+	if err := configurations.ClearShardOverrides(); err != nil {
+		log.Printf("failed to clear shard overrides: %v", err)
+	}
+
+	if *benchmarkPath != "" {
+		if err := runBenchmark(*benchmarkPath); err != nil {
+			log.Fatalf("benchmark failed: %v", err)
+		}
+		return
+	}
+
 	if err := flattenCSV(inputCSVPath, flatCSVPath); err != nil {
 		log.Fatalf("failed to flatten csv: %v", err)
 	}
@@ -431,53 +564,45 @@ func collectAndSortSetIDs(items map[string][]OrderedItem) []string {
 }
 
 func processSet(ctx context.Context, items []OrderedItem, clientTimestamps map[int]int, timestampMu *sync.Mutex, perf *performanceTracker, recorded *[]configurations.Transaction) {
-	var segment []configurations.Transaction
+	var batch []configurations.Transaction
 	for _, item := range items {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 		switch item.Kind {
 		case "txn":
-			segment = append(segment, item.Txn)
+			batch = append(batch, item.Txn)
 		case "fail":
-			processSegmentTransactions(ctx, segment, clientTimestamps, timestampMu, perf, recorded)
+			runTxnBatch(ctx, batch, clientTimestamps, timestampMu, perf, recorded)
 			if ctx.Err() != nil {
 				return
 			}
-			segment = nil
+			batch = nil
 			fmt.Printf("Failing node n%d\n", item.Node)
 			setNodeStatus(item.Node, false)
 		case "recover":
-			processSegmentTransactions(ctx, segment, clientTimestamps, timestampMu, perf, recorded)
+			runTxnBatch(ctx, batch, clientTimestamps, timestampMu, perf, recorded)
 			if ctx.Err() != nil {
 				return
 			}
-			segment = nil
+			batch = nil
 			fmt.Printf("Recovering node n%d\n", item.Node)
 			setNodeStatus(item.Node, true)
 		}
 	}
-	processSegmentTransactions(ctx, segment, clientTimestamps, timestampMu, perf, recorded)
+	runTxnBatch(ctx, batch, clientTimestamps, timestampMu, perf, recorded)
 }
 
-var clusterLeaders = map[int]int{
-	1: 1,
-	2: 4,
-	3: 7,
-}
-var leaderMutex sync.RWMutex
-
-func processSegmentTransactions(ctx context.Context, transactions []configurations.Transaction, clientTimestamps map[int]int, timestampMu *sync.Mutex, perf *performanceTracker, recorded *[]configurations.Transaction) {
+func runTxnBatch(ctx context.Context, transactions []configurations.Transaction, clientTimestamps map[int]int, timestampMu *sync.Mutex, perf *performanceTracker, recorded *[]configurations.Transaction) {
 	if len(transactions) == 0 || ctx.Err() != nil {
 		return
 	}
-
 	var wg sync.WaitGroup
 	for _, txn := range transactions {
 		if ctx.Err() != nil {
 			break
 		}
-
+		txn := txn
 		timestampMu.Lock()
 		if clientTimestamps[txn.Sender] == 0 {
 			clientTimestamps[txn.Sender] = 1
@@ -490,7 +615,6 @@ func processSegmentTransactions(ctx context.Context, transactions []configuratio
 			*recorded = append(*recorded, txn)
 		}
 
-		txnCopy := txn
 		wg.Add(1)
 		go func(t configurations.Transaction) {
 			defer wg.Done()
@@ -508,15 +632,18 @@ func processSegmentTransactions(ctx context.Context, transactions []configuratio
 			if perf != nil {
 				perf.record(start, time.Now())
 			}
-			if err := handleCrossShardCredit(ctx, t, clientTimestamps, timestampMu, perf); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				log.Printf("Cross-shard credit for txn (%d -> %d) failed: %v", t.Sender, t.Receiver, err)
-			}
-		}(txnCopy)
+		}(txn)
 	}
 	wg.Wait()
+}
+
+var (
+	clusterLeaders = make(map[int]int)
+	leaderMutex    sync.RWMutex
+)
+
+func init() {
+	resetLeaderHints()
 }
 
 func reportPerformance(setID string, tracker *performanceTracker) {
@@ -548,41 +675,6 @@ func handlePrintReshard(txns []configurations.Transaction) {
 	for _, move := range moves {
 		fmt.Printf("(%d, c%d, c%d)\n", move.Key, move.From, move.To)
 	}
-}
-
-func handleCrossShardCredit(ctx context.Context, txn configurations.Transaction, clientTimestamps map[int]int, timestampMu *sync.Mutex, perf *performanceTracker) error {
-	if txn.ReadOnly || txn.CreditOnly {
-		return nil
-	}
-	senderCluster := configurations.ResolveClusterIDForKey(txn.Sender)
-	receiverCluster := configurations.ResolveClusterIDForKey(txn.Receiver)
-	if senderCluster == 0 || receiverCluster == 0 || senderCluster == receiverCluster {
-		return nil
-	}
-
-	creditTxn := configurations.Transaction{
-		Sender:     txn.Receiver,
-		Receiver:   txn.Receiver,
-		Amount:     txn.Amount,
-		CreditOnly: true,
-	}
-
-	timestampMu.Lock()
-	if clientTimestamps[creditTxn.Sender] == 0 {
-		clientTimestamps[creditTxn.Sender] = 1
-	}
-	creditTxn.Timestamp = clientTimestamps[creditTxn.Sender]
-	clientTimestamps[creditTxn.Sender]++
-	timestampMu.Unlock()
-
-	start := time.Now()
-	if err := sendTransaction(ctx, creditTxn); err != nil {
-		return err
-	}
-	if perf != nil {
-		perf.record(start, time.Now())
-	}
-	return nil
 }
 
 func executeReshard(txns []configurations.Transaction) ([]reshardMove, error) {
@@ -645,36 +737,31 @@ func buildReshardAssignments(txns []configurations.Transaction) map[int]int {
 		return assignments
 	}
 
-	capacity := make([]int, 3)
-	base := len(keys) / 3
-	rem := len(keys) % 3
-	for i := 0; i < 3; i++ {
-		capacity[i] = base
-		if i < rem {
-			capacity[i]++
-		}
-		if capacity[i] == 0 && len(keys) > 0 {
-			capacity[i] = 1
-		}
+	clusterCount := configurations.ClusterCount()
+	if clusterCount <= 0 {
+		clusterCount = 1
 	}
-	sizes := make([]int, 3)
-	const bigPenalty = 1000
-
 	for _, key := range keys {
-		bestCluster := 1
+		currentCluster := configurations.ResolveClusterIDForKey(key)
+		defaultCluster := configurations.DefaultClusterForKey(key)
+		if currentCluster == 0 {
+			currentCluster = defaultCluster
+		}
+		if currentCluster == 0 {
+			currentCluster = 1
+		}
+		bestCluster := currentCluster
 		bestScore := int(^uint(0) >> 1)
-		for clusterIdx := 0; clusterIdx < 3; clusterIdx++ {
+		for clusterIdx := 0; clusterIdx < clusterCount; clusterIdx++ {
 			score := 0
-			if capacity[clusterIdx] > 0 && sizes[clusterIdx] >= capacity[clusterIdx] {
-				score += (sizes[clusterIdx] - capacity[clusterIdx] + 1) * bigPenalty
-			}
-			if defaultCluster := configurations.DefaultClusterForKey(key); defaultCluster == clusterIdx+1 {
+			clusterID := clusterIdx + 1
+			if defaultCluster == clusterID {
 				score--
 			}
 			if neighbors, ok := adj[key]; ok {
 				for neighbor, weight := range neighbors {
 					if assignedCluster, exists := assignments[neighbor]; exists {
-						if assignedCluster == clusterIdx+1 {
+						if assignedCluster == clusterID {
 							score -= weight
 						} else {
 							score += weight
@@ -682,13 +769,15 @@ func buildReshardAssignments(txns []configurations.Transaction) map[int]int {
 					}
 				}
 			}
-			if score < bestScore {
+			if score < bestScore ||
+				(score == bestScore && clusterID == currentCluster) ||
+				(score == bestScore && clusterID == defaultCluster) ||
+				(score == bestScore && clusterID < bestCluster) {
 				bestScore = score
-				bestCluster = clusterIdx + 1
+				bestCluster = clusterID
 			}
 		}
 		assignments[key] = bestCluster
-		sizes[bestCluster-1]++
 	}
 
 	return assignments
@@ -783,6 +872,46 @@ func sendTransaction(ctx context.Context, txn configurations.Transaction) error 
 		return fmt.Errorf("no cluster found for sender %d", txn.Sender)
 	}
 
+	logResult := func(resp *configurations.Reply) {
+		if resp == nil {
+			return
+		}
+		msg := resp.Msg
+		if txn.ReadOnly {
+			if msg == "" {
+				msg = "Failed"
+			}
+			output := fmt.Sprintf("Txn READ(%d, ts %d) result: %s (ballot=%d node=%d ts=%d)",
+				txn.Sender, txn.Timestamp, msg, resp.B.B, resp.B.NodeID, resp.Timestamp)
+			if benchmarkingEnabled() {
+				return
+			} else {
+				fmt.Println(output)
+			}
+			return
+		}
+		if msg == "" {
+			if resp.Result {
+				msg = "Successful"
+			} else {
+				msg = "Failed"
+			}
+		}
+		output := fmt.Sprintf("Txn (%d -> %d, amt %d, ts %d) result: %s (ballot=%d node=%d ts=%d)",
+			txn.Sender, txn.Receiver, txn.Amount, txn.Timestamp, msg, resp.B.B, resp.B.NodeID, resp.Timestamp)
+		if benchmarkingEnabled() {
+			return
+		} else {
+			fmt.Println(output)
+		}
+	}
+
+	retryDelay := 500 * time.Millisecond
+	maxDelay := retryDelay
+	if benchmarkingEnabled() {
+		retryDelay = 5 * time.Millisecond
+		maxDelay = 50 * time.Millisecond
+	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -807,16 +936,12 @@ func sendTransaction(ctx context.Context, txn configurations.Transaction) error 
 			}
 
 			if resp.Result {
-				if txn.CreditOnly {
-					return nil
-				}
-				if txn.ReadOnly {
-					fmt.Printf("Txn READ(%d, ts %d) result: %s (ballot=%d node=%d ts=%d)\n",
-						txn.Sender, txn.Timestamp, resp.Msg, resp.B.B, resp.B.NodeID, resp.Timestamp)
-				} else {
-					fmt.Printf("Txn (%d -> %d, amt %d, ts %d) result: %s (ballot=%d node=%d ts=%d)\n",
-						txn.Sender, txn.Receiver, txn.Amount, txn.Timestamp, resp.Msg, resp.B.B, resp.B.NodeID, resp.Timestamp)
-				}
+				logResult(resp)
+				return nil
+			}
+
+			if !shouldRetryResponse(resp.Msg) {
+				logResult(resp)
 				return nil
 			}
 		}
@@ -824,9 +949,26 @@ func sendTransaction(ctx context.Context, txn configurations.Transaction) error 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(retryDelay):
+		}
+		if benchmarkingEnabled() && retryDelay < maxDelay {
+			retryDelay *= 2
+			if retryDelay > maxDelay {
+				retryDelay = maxDelay
+			}
 		}
 	}
+}
+
+func shouldRetryResponse(msg string) bool {
+	switch msg {
+	case "", "Locked", "LeaderUnknown", "NotLeader", "Majority Not Accepted":
+		return true
+	}
+	if strings.HasPrefix(msg, "ParticipantPrepare") {
+		return true
+	}
+	return false
 }
 
 func broadcastToCluster(txn configurations.Transaction, clusterID, skipNode int) (*configurations.Reply, error) {
@@ -861,19 +1003,43 @@ func callClusterNode(txn configurations.Transaction, nodeID int) (*configuration
 	return &resp, nil
 }
 
-func callNodeRPC(nodeID int, method string, req interface{}, resp interface{}) error {
+func dialNodeClient(nodeID int) (*rpc.Client, error) {
 	port := configurations.GetNodePort(nodeID)
 	if port == 0 {
-		return fmt.Errorf("no port for node %d", nodeID)
+		return nil, fmt.Errorf("no port for node %d", nodeID)
 	}
 	client, err := rpc.DialHTTP("tcp", fmt.Sprintf("localhost:%d", port))
 	if err != nil {
-		return fmt.Errorf("failed to connect to node %d: %w", nodeID, err)
+		return nil, fmt.Errorf("failed to connect to node %d: %w", nodeID, err)
 	}
-	defer client.Close()
+	return client, nil
+}
+
+func callNodeRPC(nodeID int, method string, req interface{}, resp interface{}) error {
+	pooled, err := getRPCClient(nodeID)
+	if err != nil {
+		return err
+	}
+	slot := pooled.pickSlot()
+	slot.mu.Lock()
+	if slot.client == nil {
+		client, err := dialNodeClient(nodeID)
+		if err != nil {
+			slot.mu.Unlock()
+			return err
+		}
+		slot.client = client
+	}
+	client := slot.client
 	if err := client.Call(method, req, resp); err != nil {
+		if slot.client == client {
+			slot.client.Close()
+			slot.client = nil
+		}
+		slot.mu.Unlock()
 		return fmt.Errorf("%s RPC to node %d failed: %w", method, nodeID, err)
 	}
+	slot.mu.Unlock()
 	return nil
 }
 
@@ -882,7 +1048,8 @@ func applyInitialLiveness(liveNodes []int) {
 	for _, node := range liveNodes {
 		liveSet[node] = true
 	}
-	for nodeID := 1; nodeID <= 9; nodeID++ {
+	totalNodes := configurations.TotalNodeCount()
+	for nodeID := 1; nodeID <= totalNodes; nodeID++ {
 		setNodeStatus(nodeID, liveSet[nodeID])
 	}
 }
@@ -906,8 +1073,30 @@ func setNodeStatus(nodeID int, live bool) {
 	}
 }
 
+func resetLeaderHints() {
+	leaderMutex.Lock()
+	defer leaderMutex.Unlock()
+	if clusterLeaders == nil {
+		clusterLeaders = make(map[int]int)
+	} else {
+		for k := range clusterLeaders {
+			delete(clusterLeaders, k)
+		}
+	}
+	clusterCount := configurations.ClusterCount()
+	if clusterCount <= 0 {
+		return
+	}
+	for clusterID := 1; clusterID <= clusterCount; clusterID++ {
+		if leaderID := configurations.GetClusterLeaderID(clusterID); leaderID != 0 {
+			clusterLeaders[clusterID] = leaderID
+		}
+	}
+}
+
 func flushSystem() {
-	for nodeID := 1; nodeID <= 9; nodeID++ {
+	totalNodes := configurations.TotalNodeCount()
+	for nodeID := 1; nodeID <= totalNodes; nodeID++ {
 		port := configurations.GetNodePort(nodeID)
 		if port == 0 {
 			continue
@@ -920,12 +1109,41 @@ func flushSystem() {
 		client.Call("Node.FlushState", true, &reply)
 		client.Close()
 	}
+	// Drop cached RPC clients so connections are re-established cleanly per run.
+	for nodeID := 1; nodeID <= totalNodes; nodeID++ {
+		invalidateRPCClient(nodeID)
+	}
+	// Restore leader hints to defaults to avoid routing retries to stale leaders.
+	resetLeaderHints()
 }
 
 func allNodeIDs() []int {
-	nodes := make([]int, 0, 9)
-	for i := 1; i <= 9; i++ {
+	total := configurations.TotalNodeCount()
+	if total <= 0 {
+		return nil
+	}
+	nodes := make([]int, 0, total)
+	for i := 1; i <= total; i++ {
 		nodes = append(nodes, i)
 	}
 	return nodes
+}
+
+func configureNodesBenchmarkMode(enabled bool) {
+	for _, nodeID := range allNodeIDs() {
+		port := configurations.GetNodePort(nodeID)
+		if port == 0 {
+			continue
+		}
+		client, err := rpc.DialHTTP("tcp", fmt.Sprintf("localhost:%d", port))
+		if err != nil {
+			log.Printf("BenchmarkMode: failed to connect to node %d: %v", nodeID, err)
+			continue
+		}
+		var reply bool
+		if err := client.Call("Node.SetBenchmarkMode", enabled, &reply); err != nil {
+			log.Printf("BenchmarkMode RPC to n%d failed: %v", nodeID, err)
+		}
+		client.Close()
+	}
 }

@@ -33,6 +33,9 @@ func ConnectDB(n *configurations.Node) error {
 	if err != nil {
 		return err
 	}
+	if err := configureDB(db); err != nil {
+		return err
+	}
 	n.Db = db
 	return nil
 }
@@ -43,6 +46,9 @@ func InitDB(n *configurations.Node) error {
 	if err != nil {
 		return err
 	}
+	if err := configureDB(db); err != nil {
+		return err
+	}
 	n.Db = db
 
 	_, err = n.Db.Exec(`CREATE TABLE IF NOT EXISTS balances (key INTEGER PRIMARY KEY, balance INTEGER)`)
@@ -50,15 +56,7 @@ func InitDB(n *configurations.Node) error {
 		return err
 	}
 
-	var keyStart, keyEnd int
-	switch n.ClusterId {
-	case 1:
-		keyStart, keyEnd = 1, 3000
-	case 2:
-		keyStart, keyEnd = 3001, 6000
-	case 3:
-		keyStart, keyEnd = 6001, 9000
-	}
+	keyStart, keyEnd := configurations.GetClusterKeyRange(n.ClusterId)
 
 	tx, err := n.Db.Begin()
 	if err != nil {
@@ -72,6 +70,9 @@ func InitDB(n *configurations.Node) error {
 	}
 	defer stmt.Close()
 
+	if keyStart <= 0 || keyEnd < keyStart {
+		return tx.Commit()
+	}
 	for key := keyStart; key <= keyEnd; key++ {
 		_, err = stmt.Exec(key, 10)
 		if err != nil {
@@ -112,8 +113,8 @@ func main() {
 	node.SequenceNumber = 0
 	node.LastExecuted = 0
 	node.IsLive = true
-	node.T = 3 * time.Second
-	node.Tp = node.T / 4
+	node.T = 6 * time.Second
+	node.Tp = (node.T * 2) / 3
 	node.TransactionStatus = make(map[int]string)
 	node.ClientLastReply = make(map[int]int)
 	node.TxnsProcessed = make(map[string]configurations.Reply)
@@ -176,6 +177,25 @@ func CloseNode(n *configurations.Node) {
 	if n.Db != nil {
 		n.Db.Close()
 	}
+}
+
+func configureDB(db *sql.DB) error {
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA synchronous=OFF;",
+		"PRAGMA temp_store=MEMORY;",
+		"PRAGMA mmap_size=134217728;",
+		"PRAGMA cache_size=-64000;",
+	}
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			return err
+		}
+	}
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(32)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	return nil
 }
 
 func readIntInput(reader *bufio.Reader, prompt string) (int, error) {

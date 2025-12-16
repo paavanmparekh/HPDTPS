@@ -1,0 +1,11 @@
+{
+  "totalTxns": 200,
+  "txnsPerSet": 200,
+  "readOnlyPct": 0.2,
+  "crossShardPct": 0.1,
+  "skew": 0.0,
+  "runs": 1,
+  "seed": 202501,
+  "amountMin": 1,
+  "amountMax": 10
+}
